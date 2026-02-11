@@ -60,9 +60,6 @@ def scoring_matrix(p: torch.Tensor, loss_code: str, eps: float = 1e-8) -> torch.
         raise ValueError(f"Unknown proper loss code: {loss_code}")
     
 
-
-
-
 # ---------- EM-style marginal-chain objective ----------
 class MarginalChainProperLoss(nn.Module):
     """
@@ -132,7 +129,114 @@ class MarginalChainProperLoss(nn.Module):
             return loss_per_sample
 
 
+# ---------- Importance Reweighting ----------
+class IRLoss(nn.Module):
+    """
+    Importance reweighting loss
+    """
 
+    def __init__(self, M, loss_code: str, reduction: str = "mean", eps: float = 1e-28):
+        super().__init__()
+        self.logsoftmax = nn.LogSoftmax(dim=1)
+        self.M = torch.as_tensor(M, dtype=torch.float32)
+        self.loss_code = loss_code
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+
+        z = z.long()
+
+        # 1. Compute probabilities and log-probabilities
+        logp = self.logsoftmax(logits)     # (B, C) = log p
+        p = logp.exp()                     # (B, C) = p
+
+        # 2. Compute Q as a constant (no gradient flow)
+        # Using a context manager makes the 'constant' intent very clear
+        with torch.no_grad():
+            M = self.M.to(logits.device)
+            Mp = p @ M.T
+            
+            # Add a small epsilon to avoid division by zero
+            Q = p / (Mp + 1e-9)
+
+        if self.loss_code == "cross_entropy":
+            # 1. Gather the probability for the true class z
+            pz = p.gather(1, z.view(-1, 1)).squeeze(1)
+            pz = pz.clamp_min(self.eps)
+            
+            # 2. Gather the weight Q for the true class z (matching shapes)
+            Qz = Q.gather(1, z.view(-1, 1)).squeeze(1)
+            
+            # Now both Qz and torch.log(pz) are shape (B,)
+            loss_per_sample = -Qz * torch.log(pz)
+            
+        else:
+            # For other scoring rules, compute the full matrix S first
+            # Note: I used 'p' here as 'r' was likely a typo in your snippet
+            S = Q * scoring_matrix(p, self.loss_code)
+            
+            # Then gather the specific loss for target class z
+            loss_per_sample = S.gather(1, z.view(-1, 1)).squeeze(1)
+
+        if self.reduction == "mean":
+            return loss_per_sample.mean()
+        elif self.reduction == "sum":
+            return loss_per_sample.sum()
+        return loss_per_sample
+
+
+class PiCOLoss(nn.Module):
+    """
+    """
+
+    def __init__(self, loss_code: str, reduction: str = "mean",
+                 eps: float = 1e-28):
+
+        super().__init__()
+        self.logsoftmax = nn.LogSoftmax(dim=1)
+        self.loss_code = loss_code
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, z: torch.Tensor,
+                Q: torch.Tensor) -> torch.Tensor:
+        """
+        Commputes the forward loss for pseudo-targets Q.
+        
+        Parameters
+        ----------
+        logits : torch.Tensor
+            The model outputs (before softmax)
+        Q : torch.Tensor
+            The pseudo-targets.
+        """
+
+        # p 和你原来的一样：log_softmax + exp
+        logp = self.logsoftmax(logits)     # (B, C) = log p
+        p = logp.exp()                     # (B, C) = p
+
+        # ---------- E-step: 责任 Q（数值上 posterior，反向里当常数） ----------
+        Q = Q.detach()                     # 非常重要：Q 不反传梯度
+
+        if self.loss_code == "cross_entropy":
+            # ---------- 原始 MC 的部分：L_MC = E_Q[-log p] ----------
+            # scoring_matrix(p, "cross_entropy") = -log(p)，
+            # 这里直接用 logp 更干净：-log p = -logp.exp().log() = -logp
+            S = -logp                      # (B, C)
+            loss_per_sample = (Q * S).sum(dim=1)   # (B,)
+
+        else:
+            # ---------- 其它 scoring rule: 保持原始 MC 定义 ----------
+            S = scoring_matrix(p, self.loss_code)       # (B, C)
+            loss_per_sample = (Q * S).sum(dim=1)        # (B,)
+
+        if self.reduction == "mean":
+            return loss_per_sample.mean()
+        elif self.reduction == "sum":
+            return loss_per_sample.sum()
+        else:
+            return loss_per_sample
 
 
 # ---------- Forward (plug-in) marginal-chain objective ----------
@@ -167,11 +271,6 @@ class ForwardProperLoss(nn.Module):
             return loss_per_sample.sum()
         else:
             return loss_per_sample
-
-
-
-
-
 
 
 class UpperBoundWeakProperLoss(nn.Module):
