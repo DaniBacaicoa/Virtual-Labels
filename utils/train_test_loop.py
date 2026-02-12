@@ -264,8 +264,8 @@ def clothing_train_and_evaluate(
     model.to(device)
 
     num_samples = len(trainloader.dataset)
-    num_classes = model.num_classes if hasattr(model, "num_classes") else outputs.size(1)
-
+    #num_classes = model.num_classes if hasattr(model, "num_classes") else outputs.size(1)
+    num_classes = 14
     pseudo_labels = torch.zeros(
         num_samples,
         num_classes,
@@ -381,7 +381,7 @@ def clothing_train_and_evaluate(
             'train_loss': train_loss,
             #'train_acc': train_acc.item(),
             'test_acc': test_acc.item(),
-            'train_detached_loss': detached_train_loss,
+            #'train_detached_loss': detached_train_loss,
             'test_detached_loss': detached_test_loss,
             'actual_lr': actual_lr,
             'epoch_time': epoch_time,
@@ -390,8 +390,9 @@ def clothing_train_and_evaluate(
 
         if epoch % sound == sound - 1:
             print(f'Epoch {epoch+1}/{num_epochs}: Train Loss: {train_loss:.4f}, '
-                  f'Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}, '
-                  f'Train Detached Loss: {detached_train_loss:.4f}, '
+                  #f'Train Acc: {train_acc:.4f}, 
+                  f'Test Acc: {test_acc:.4f}, '
+                  #f'Train Detached Loss: {detached_train_loss:.4f}, '
                   f'Test Detached Loss: {detached_test_loss:.4f}, '
                   f'Learning Rate: {actual_lr:.6f}, '
                   f'Epoch Time: {epoch_time:.2f} seconds')
