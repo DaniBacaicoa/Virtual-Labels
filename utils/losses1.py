@@ -339,3 +339,124 @@ class UpperBoundWeakProperLoss(nn.Module):
         elif self.reduction == "sum":
             return loss.sum()
         return loss
+
+
+
+class UpperBoundWeakProperLoss(nn.Module):
+    """
+    真正把 weak-label 目标做成：E_{y~posterior}[ proper_loss(f, y) ]（分离型、对 true classes）
+    M: (D, C)  p(z | y)
+    logits: (B, C)
+    z_weak: (B,)
+    """
+    def __init__(self, M, loss_code: str, reduction="mean", eps=1e-12):
+        super().__init__()
+        self.register_buffer("M", torch.as_tensor(M, dtype=torch.float32))
+        self.loss_code = loss_code
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, z_weak: torch.Tensor) -> torch.Tensor:
+        z_weak = z_weak.long()
+        logp = F.log_softmax(logits, dim=1)         # (B,C)
+        f = logp.exp()                               # (B,C)
+
+        M = self.M.to(device=logits.device, dtype=logits.dtype)  # (D,C)
+        Mz = M[z_weak]                                # (B,C)  取每个样本对应的那一行
+
+        # posterior r over true classes: r_j ∝ m_{zj} f_j
+        num = Mz * f                                  # (B,C)
+        den = num.sum(dim=1, keepdim=True) + self.eps # (B,1)
+        r = (num / den).detach()                      # (B,C)  MM: stop-grad on r
+
+        # ---------- losses on f with soft target r ----------
+        if self.loss_code == "cross_entropy":
+            loss = -(r * logp).sum(dim=1)             # (B,)
+
+        elif self.loss_code in ("brier", "squared", "mse"):
+            # E_y ||f - e_y||^2 = ||f - r||^2 + const(r)，优化时用 ||f-r||^2 就行
+            loss = ((f - r) ** 2).sum(dim=1)
+
+        elif self.loss_code.startswith("ps_"):
+            beta = float(self.loss_code.split("_", 1)[1])
+            if beta <= 1.0:
+                raise ValueError("ps_β 要求 beta > 1")
+
+            f_safe = f + self.eps
+            num = (r * f_safe.pow(beta)).sum(dim=1)   # (B,)
+            denom = f_safe.pow(beta).sum(dim=1).pow(1.0 / beta) + self.eps
+            loss = - num / (beta * denom)             # (B,)
+
+        elif self.loss_code.startswith("tsallis_"):
+            alpha = float(self.loss_code.split("_", 1)[1])
+            if abs(alpha - 1.0) < 1e-6:
+                loss = -(r * logp).sum(dim=1)
+            else:
+                a = alpha - 1.0
+                f_safe = f + self.eps
+                # 用 log 形式更稳：f^{alpha-1} = exp((alpha-1) log f)
+                f_a1 = torch.exp((alpha - 1.0) * torch.log(f_safe))
+                term = (1.0 - alpha * f_a1) / a        # (B,C)
+                main = (r * term).sum(dim=1)           # E_y[phi(f_y)]
+                extra = f_safe.pow(alpha).sum(dim=1)   # (B,)
+                loss = main + extra
+        else:
+            raise ValueError(f"Unknown loss_code={self.loss_code}")
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+
+class ForwardBackwardProperLoss(nn.Module):
+    def __init__(self, B_mat, F_mat, loss_code: str,
+                 k: float = 0.0, beta: float = 1.0, reduction: str = "mean", eps: float = 1e-12):
+        super().__init__()
+        self.logsoftmax = nn.LogSoftmax(dim=1)
+        self.softmax = nn.Softmax(dim=1)
+        self.B = torch.as_tensor(B_mat, dtype=torch.float32)
+        self.F = torch.as_tensor(F_mat, dtype=torch.float32)
+        self.loss_code = loss_code
+        
+        self.reduction = reduction
+        self.eps = eps
+
+        self.k = k
+        self.beta = beta
+
+    def forward(self, logits: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+
+        z = z.long()
+        z = z-1 # Im not sure of this but it works for now. This index should be from 0 to d-1 isnt it?
+        v = logits - logits.mean(dim=1, keepdim=True)
+        p = self.softmax(v)  
+
+        Bmat = self.B.to(logits.device) 
+        Fmat = self.F.to(logits.device)  
+
+        r = torch.matmul(Fmat, p.T).T # If Fmat = I then it does nothing
+
+        if self.loss_code == "cross_entropy":
+            r_safe = r.clamp_min(self.eps)
+            S = -torch.log(r_safe)                
+        else:
+            S = scoring_matrix(r, self.loss_code)  
+
+        Bz = Bmat[z]                         
+
+        loss = (Bz * S).sum(dim=1)   
+
+        # Regularization of Yoshida's loss.
+        if self.k != 0.0:
+            reg = 0.5 * self.k * torch.sum(torch.abs(v) ** self.beta, dim=1) 
+            loss = loss + reg
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
